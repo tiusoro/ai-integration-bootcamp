@@ -1,52 +1,218 @@
 import time
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import openai
 import os
+from typing import Literal, Optional
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, status
+from pydantic import BaseModel, Field, EmailStr, field_validator
+import openai
 from dotenv import load_dotenv
 
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI()
+app = FastAPI(title="AI Integration Bootcamp API", version="0.2.0")
+
+
+# ───────────────────────────────────────────────
+# REQUEST MODELS (what clients send us)
+# ───────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The message to send to the AI"
+    )
+    model: Literal["gpt-4o-mini", "gpt-4o"] = Field(
+        default="gpt-4o-mini",
+        description="Which model to use"
+    )
+    temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=2.0,
+        description="Creativity: 0 = deterministic, 2 = maximum randomness"
+    )
+    max_tokens: int = Field(
+        default=500,
+        ge=1,
+        le=4096,
+        description="Maximum tokens in the response"
+    )
+    system_prompt: Optional[str] = Field(
+        default="You are a helpful assistant.",
+        max_length=2000,
+        description="Override the default system behavior"
+    )
 
-def call_openai_with_retry(message: str, max_retries: int = 3):
-    """Retry with exponential backoff on rate limits."""
+    @field_validator("message")
+    @classmethod
+    def no_empty_strings(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Message cannot be whitespace only")
+        return v.strip()
+
+
+class UserRegistration(BaseModel):
+    email: EmailStr
+    tier: Literal["free", "pro", "enterprise"] = "free"
+    company: Optional[str] = Field(default=None, max_length=100)
+
+
+# ───────────────────────────────────────────────
+# RESPONSE MODELS (what we guarantee to clients)
+# ───────────────────────────────────────────────
+
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    model_used: str
+    usage: UsageInfo
+    response_time_ms: float
+    timestamp: str
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    error_code: str
+    suggestion: Optional[str] = None
+
+
+# ───────────────────────────────────────────────
+# PRICING ENGINE
+# ───────────────────────────────────────────────
+
+PRICING = {
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+}
+
+
+def calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    rates = PRICING.get(model, PRICING["gpt-4o-mini"])
+    input_cost = (prompt_tokens / 1_000_000) * rates["input"]
+    output_cost = (completion_tokens / 1_000_000) * rates["output"]
+    return round(input_cost + output_cost, 6)
+
+
+# ───────────────────────────────────────────────
+# OPENAI CLIENT WITH RETRY
+# ───────────────────────────────────────────────
+
+def call_openai_with_retry(
+    messages: list,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    max_retries: int = 3
+):
     for attempt in range(max_retries):
         try:
             return client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": message}]
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
             )
         except openai.RateLimitError:
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # 1s, 2s, 4s
-                time.sleep(wait_time)
+                time.sleep(2 ** attempt)
             else:
                 raise
         except openai.APIError:
             raise
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    try:
-        response = call_openai_with_retry(request.message)
-        return {
-            "answer": response.choices[0].message.content,
-            "model": response.model,
-            "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens
-            }
-        }
-    except openai.RateLimitError:
-        return {"error": "Rate limited. Try Again in 60 seconds."}
-    except openai.APIError as e:
-        return {"error": f"OpenAI error: {str(e)}"}
 
-@app.get("/health")
+# ───────────────────────────────────────────────
+# ENDPOINTS
+# ───────────────────────────────────────────────
+
+@app.get("/health", response_model=dict)
 async def health():
-    return {"status": "ok", "service": "ai-integration-bootcamp"}
+    return {
+        "status": "ok",
+        "service": "ai-integration-bootcamp",
+        "version": "0.2.0",
+        "models_available": list(PRICING.keys())
+    }
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    start_time = time.time()
+    
+    messages = [
+        {"role": "system", "content": request.system_prompt},
+        {"role": "user", "content": request.message}
+    ]
+    
+    try:
+        response = call_openai_with_retry(
+            messages=messages,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
+    except openai.RateLimitError:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please retry in 60 seconds."
+        )
+    except openai.APIError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"OpenAI service error: {str(e)}"
+        )
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return ChatResponse(
+        answer=response.choices[0].message.content,
+        model_used=response.model,
+        usage=UsageInfo(
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=response.usage.completion_tokens,
+            total_tokens=response.usage.total_tokens,
+            estimated_cost_usd=calculate_cost(
+                request.model,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens
+            )
+        ),
+        response_time_ms=elapsed_ms,
+        timestamp=datetime.utcnow().isoformat()
+    )
+
+
+@app.post("/register", response_model=UserRegistration)
+async def register(user: UserRegistration):
+    # In real app: hash password, store in DB, send email
+    return {
+        "email": user.email,
+        "tier": user.tier,
+        "company": user.company,
+        "registered_at": datetime.utcnow().isoformat()
+    }
+
+
+@app.get("/pricing")
+async def pricing():
+    return {
+        "models": {
+            model: {
+                "input_per_1m_tokens": rates["input"],
+                "output_per_1m_tokens": rates["output"]
+            }
+            for model, rates in PRICING.items()
+        },
+        "note": "Costs are estimates. Actual billing may vary."
+    }
+
