@@ -1,5 +1,4 @@
-import time
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 import openai
 import os
@@ -13,27 +12,13 @@ app = FastAPI()
 class ChatRequest(BaseModel):
     message: str
 
-def call_openai_with_retry(message: str, max_retries: int = 3):
-    """Retry with exponential backoff on rate limits."""
-    for attempt in range(max_retries):
-        try:
-            return client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": message}]
-            )
-        except openai.RateLimitError:
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # 1s, 2s, 4s
-                time.sleep(wait_time)
-            else:
-                raise
-        except openai.APIError:
-            raise
-
 @app.post("/chat")
 async def chat(request: ChatRequest):
     try:
-        response = call_openai_with_retry(request.message)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Cheapest for practice
+            messages=[{"role": "user", "content": request.message}]
+        )
         return {
             "answer": response.choices[0].message.content,
             "model": response.model,
@@ -43,10 +28,11 @@ async def chat(request: ChatRequest):
             }
         }
     except openai.RateLimitError:
-        return {"error": "Rate limited. Try again in 60 seconds."}
+        return {"error": "Rate limited. Slow down."}
     except openai.APIError as e:
         return {"error": f"OpenAI error: {str(e)}"}
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "ai-integration-bootcamp"}
+
