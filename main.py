@@ -43,7 +43,7 @@ async def chat(request: ChatRequest):
             }
         }
     except openai.RateLimitError:
-        return {"error": "Rate limited. Try again in 60 seconds."}
+        return {"error": "Rate limited. Try Again in 60 seconds."}
     except openai.APIError as e:
         return {"error": f"OpenAI error: {str(e)}"}
 
