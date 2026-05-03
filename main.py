@@ -2,6 +2,7 @@ import time
 import os
 from typing import Literal, Optional
 from datetime import datetime
+from memory import memory
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, EmailStr, field_validator
@@ -54,22 +55,42 @@ class ChatRequest(BaseModel):
             raise ValueError("Message cannot be whitespace only")
         return v.strip()
 
+class UsageInfo(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float
+
 
 class UserRegistration(BaseModel):
     email: EmailStr
     tier: Literal["free", "pro", "enterprise"] = "free"
     company: Optional[str] = Field(default=None, max_length=100)
 
+class ChatWithMemoryRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    user_id: str = Field(..., min_length=1, description="Unique user identifier")
+    session_id: Optional[str] = Field(default=None, description="Override auto-generated session")
+    system_prompt: Optional[str] = "You are a helpful assistant with perfect memory."
+    model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(500, ge=1, le=4096)
+
+
+class ChatWithMemoryResponse(BaseModel):
+    answer: str
+    session_id: str
+    history_length: int
+    model_used: str
+    usage: UsageInfo
+    response_time_ms: float
+
+
 
 # ───────────────────────────────────────────────
 # RESPONSE MODELS (what we guarantee to clients)
 # ───────────────────────────────────────────────
 
-class UsageInfo(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    estimated_cost_usd: float
 
 
 class ChatResponse(BaseModel):
@@ -215,4 +236,92 @@ async def pricing():
         },
         "note": "Costs are estimates. Actual billing may vary."
     }
+
+@app.post("/chat/memory", response_model=ChatWithMemoryResponse)
+async def chat_with_memory(request: ChatWithMemoryRequest):
+    start_time = time.time()
+    
+    # Generate or use provided session ID
+    session_id = request.session_id or memory._generate_session_id(request.user_id, "default")
+    
+    # Build message list with history
+    messages = [{"role": "system", "content": request.system_prompt}]
+    messages.extend(memory.get_history(session_id))
+    messages.append({"role": "user", "content": request.message})
+    
+    try:
+        response = call_openai_with_retry(
+            messages=messages,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
+    except openai.RateLimitError:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    except openai.APIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    
+    answer = response.choices[0].message.content
+    
+    # Store both user message and AI response
+    memory.add_message(session_id, "user", request.message)
+    memory.add_message(session_id, "assistant", answer)
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return ChatWithMemoryResponse(
+        answer=answer,
+        session_id=session_id,
+        history_length=len(memory.get_history(session_id)),
+        model_used=response.model,
+        usage=UsageInfo(
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=response.usage.completion_tokens,
+            total_tokens=response.usage.total_tokens,
+            estimated_cost_usd=calculate_cost(
+                request.model,
+                response.usage.prompt_tokens,
+                response.usage.completion_tokens
+            )
+        ),
+        response_time_ms=elapsed_ms
+    )
+
+
+@app.get("/chat/memory/{session_id}")
+async def get_memory(session_id: str):
+    """Retrieve full conversation history for a session."""
+    history = memory.get_history(session_id)
+    info = memory.get_session_info(session_id)
+    return {
+        "session_info": info,
+        "history": history
+    }
+
+
+@app.delete("/chat/memory/{session_id}")
+async def clear_memory(session_id: str):
+    """Clear a conversation session."""
+    cleared = memory.clear_session(session_id)
+    if not cleared:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "cleared", "session_id": session_id}
+
+
+@app.get("/chat/memory")
+async def list_sessions():
+    """List all active sessions (dev only — remove in production)."""
+    return {
+        "active_sessions": len(memory.sessions),
+        "sessions": [
+            {
+                "session_id": sid,
+                "message_count": len(msgs),
+                "last_message": msgs[-1]["content"][:50] + "..." if msgs else None
+            }
+            for sid, msgs in memory.sessions.items()
+        ]
+    }
+
+
 
