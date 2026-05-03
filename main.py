@@ -3,6 +3,8 @@ import os
 from typing import Literal, Optional
 from datetime import datetime
 from memory import memory
+from token_counter import token_counter
+
 
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, EmailStr, field_validator
@@ -18,6 +20,15 @@ app = FastAPI(title="AI Integration Bootcamp API", version="0.2.0")
 # ───────────────────────────────────────────────
 # REQUEST MODELS (what clients send us)
 # ───────────────────────────────────────────────
+class BudgetChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    user_id: str = Field(..., min_length=1)
+    max_budget_usd: float = Field(0.01, ge=0.001, le=1.0, description="Max $ per request")
+    model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
+    max_tokens: int = Field(500, ge=1, le=4096)
+    system_prompt: Optional[str] = "You are a helpful assistant."
+
 
 class ChatRequest(BaseModel):
     message: str = Field(
@@ -86,12 +97,9 @@ class ChatWithMemoryResponse(BaseModel):
     response_time_ms: float
 
 
-
 # ───────────────────────────────────────────────
 # RESPONSE MODELS (what we guarantee to clients)
 # ───────────────────────────────────────────────
-
-
 
 class ChatResponse(BaseModel):
     answer: str
@@ -321,6 +329,81 @@ async def list_sessions():
             }
             for sid, msgs in memory.sessions.items()
         ]
+    }
+
+@app.post("/chat/budget")
+async def chat_with_budget(request: BudgetChatRequest):
+    """
+    Chat endpoint with pre-flight cost estimation.
+    Rejects request if estimated cost exceeds budget.
+    """
+    start_time = time.time()
+    
+    # Build messages
+    messages = [
+        {"role": "system", "content": request.system_prompt},
+        {"role": "user", "content": request.message}
+    ]
+    
+    # PRE-FLIGHT: Estimate cost before API call
+    estimate = token_counter.estimate_max_cost(
+        messages=messages,
+        model=request.model,
+        max_tokens=request.max_tokens
+    )
+    
+    if estimate["estimated_max_cost_usd"] > request.max_budget_usd:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "error": "Budget exceeded",
+                "estimated_cost": estimate["estimated_max_cost_usd"],
+                "budget": request.max_budget_usd,
+                "suggestion": "Reduce max_tokens or increase budget"
+            }
+        )
+    
+    # Call API
+    try:
+        response = call_openai_with_retry(
+            messages=messages,
+            model=request.model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens
+        )
+    except openai.RateLimitError:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    except openai.APIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    
+    # POST-FLIGHT: Compare estimate vs actual
+    actual_cost = calculate_cost(
+        request.model,
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens
+    )
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return {
+        "answer": response.choices[0].message.content,
+        "budget_check": {
+            "estimated_max_cost": estimate["estimated_max_cost_usd"],
+            "actual_cost": actual_cost,
+            "budget": request.max_budget_usd,
+            "under_budget": actual_cost <= request.max_budget_usd
+        },
+        "token_accuracy": {
+            "estimated_prompt_tokens": estimate["estimated_prompt_tokens"],
+            "actual_prompt_tokens": response.usage.prompt_tokens,
+            "difference": response.usage.prompt_tokens - estimate["estimated_prompt_tokens"]
+        },
+        "usage": {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens
+        },
+        "response_time_ms": elapsed_ms
     }
 
 
