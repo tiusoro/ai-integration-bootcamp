@@ -160,6 +160,107 @@ class ChatWithMemoryResponse(BaseModel):
     usage: UsageInfo
     response_time_ms: float
 
+# Added on Day 8
+class RAGChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    user_id: str = Field(..., min_length=1)
+    session_id: Optional[str] = None
+    max_context_chunks: int = Field(3, ge=1, le=5)
+    model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
+
+class RAGChatResponse(BaseModel):
+    answer: str
+    sources: List[Dict]
+    context_used: bool
+    tokens_used: int
+    cost_usd: float
+    response_time_ms: float
+
+@app.post("/chat/rag", response_model=RAGChatResponse)
+async def chat_rag(request: RAGChatRequest):
+    start_time = time.time()
+    
+    # Step 1: Generate embedding for the question
+    query_embedding = generate_embedding(request.message)
+    
+    # Step 2: Search vector database for relevant chunks
+    relevant_docs = search_similar(
+        embedding=query_embedding,
+        limit=request.max_context_chunks,
+        min_similarity=0.5
+    )
+    
+    context_used = len(relevant_docs) > 0
+    
+    # Step 3: Build context from retrieved documents
+    if context_used:
+        context = "\n\n".join([
+            f"Source: {doc['title']}\n{doc['content']}"
+            for doc in relevant_docs
+        ])
+        system_prompt = f"""You are a knowledge base assistant. You have access to the following documents:
+
+{context}
+
+INSTRUCTIONS:
+1. Answer using ONLY the information in these documents.
+2. Cite the source document title in your answer.
+3. If the documents do not contain the answer, say: "I don't have that information in my knowledge base."
+4. NEVER use outside knowledge. If it's not in the documents above, you don't know it."""
+    else:
+        # NO RELEVANT DOCUMENTS FOUND
+        system_prompt = """You are a knowledge base assistant. 
+
+STATUS: No relevant documents found in the knowledge base for this question.
+
+INSTRUCTIONS:
+1. You MUST say: "I don't have that information in my knowledge base."
+2. Do NOT answer from your training data.
+3. Do NOT guess or make up information."""
+    
+    # Step 4: Call AI with context
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": request.message}
+    ]
+    
+    response = call_openai_with_retry(
+        messages=messages,
+        model=request.model,
+        temperature=0.0,  # ZERO temperature for strict compliance
+        max_tokens=100    # Short response to prevent rambling
+    )
+    
+    answer = response.choices[0].message.content
+    
+    # ... rest of your code ...
+    
+    # Step 5: Calculate cost
+    cost = calculate_cost(
+        request.model,
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens
+    )
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return RAGChatResponse(
+        answer=answer,
+        sources=[
+            {
+                "title": doc["title"],
+                "similarity": round(doc["similarity"], 4),
+                "content_preview": doc["content"][:100] + "..."
+            }
+            for doc in relevant_docs
+        ],
+        context_used=context_used,
+        tokens_used=response.usage.total_tokens,
+        cost_usd=cost,
+        response_time_ms=elapsed_ms
+    )
+
+
 
 # ───────────────────────────────────────────────
 # RESPONSE MODELS (what we guarantee to clients)
@@ -495,7 +596,7 @@ class DocumentIngestResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     limit: int = Field(5, ge=1, le=20)
-    min_similarity: float = Field(0.7, ge=0.0, le=1.0)
+    min_similarity: float = Field(0.5, ge=0.0, le=1.0)
 
 class SearchResult(BaseModel):
     id: int

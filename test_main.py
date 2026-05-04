@@ -198,5 +198,29 @@ def test_support_enterprise_priority():
     assert data["escalation_needed"] is True
     assert data["cost_usd"] > 0
 
+# === DAY 8: RAG CHATBOT TESTS ===
+
+def test_chat_rag_with_context():
+    response = client.post("/chat/rag", json={
+        "message": "How long do I have to get a refund?",
+        "user_id": "rag-test-1"
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["context_used"] is True
+    assert "30 days" in data["answer"] or "refund" in data["answer"]
+    assert len(data["sources"]) > 0
+    assert data["cost_usd"] > 0
+
+def test_chat_rag_without_context():
+    response = client.post("/chat/rag", json={
+        "message": "What is the capital of France?",
+        "user_id": "rag-test-2"
+    })
+    assert response.status_code == 200
+    data = response.json()
+    # Should either use context or admit it doesn't know
+    assert "don't have" in data["answer"].lower() or data["context_used"] is True
+
 
 
