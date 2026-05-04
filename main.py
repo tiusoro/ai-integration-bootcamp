@@ -1,6 +1,6 @@
 import time
 import os
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, List
 from datetime import datetime
 from memory import memory
 from token_counter import token_counter
@@ -468,6 +468,139 @@ async def chat_with_budget(request: BudgetChatRequest):
             "total_tokens": response.usage.total_tokens
         },
         "response_time_ms": elapsed_ms
+    }
+
+# ADDED IN PHASE 2 DAY 7 
+from database import init_db, insert_document, search_similar, get_document_count
+from typing import List
+import openai
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+# Request/Response models
+class DocumentIngestRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    content: str = Field(..., min_length=1, max_length=10000)
+    metadata: Optional[Dict] = {}
+
+class DocumentIngestResponse(BaseModel):
+    id: int
+    title: str
+    chunks_stored: int
+    status: str
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(5, ge=1, le=20)
+    min_similarity: float = Field(0.7, ge=0.0, le=1.0)
+
+class SearchResult(BaseModel):
+    id: int
+    title: str
+    content: str
+    similarity: float
+
+class SearchResponse(BaseModel):
+    query: str
+    results: List[SearchResult]
+    total_found: int
+
+# Generate embedding for text
+def generate_embedding(text: str) -> List[float]:
+    response = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return response.data[0].embedding
+
+# Chunk long text into smaller pieces
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> List[str]:
+    """Split text into overlapping chunks for better search."""
+    chunks = []
+    start = 0
+    
+    while start < len(text):
+        end = start + chunk_size
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap  # Overlap for context continuity
+    
+    return chunks
+
+# Ingest endpoint
+@app.post("/documents/ingest", response_model=DocumentIngestResponse)
+async def ingest_document(request: DocumentIngestRequest):
+    start_time = time.time()
+    
+    # Chunk the content
+    chunks = chunk_text(request.content)
+    
+    # Store each chunk with its embedding
+    stored_ids = []
+    for i, chunk in enumerate(chunks):
+        embedding = generate_embedding(chunk)
+        
+        # Create metadata with chunk info
+        chunk_metadata = {
+            **request.metadata,
+            "chunk_index": i,
+            "total_chunks": len(chunks),
+            "chunk_size": len(chunk)
+        }
+        
+        doc_id = insert_document(
+            title=f"{request.title} (chunk {i+1}/{len(chunks)})",
+            content=chunk,
+            embedding=embedding,
+            metadata=chunk_metadata
+        )
+        stored_ids.append(doc_id)
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return DocumentIngestResponse(
+        id=stored_ids[0],  # Return first chunk ID
+        title=request.title,
+        chunks_stored=len(stored_ids),
+        status=f"Stored {len(stored_ids)} chunks in {elapsed_ms}ms"
+    )
+
+# Search endpoint
+@app.post("/documents/search", response_model=SearchResponse)
+async def search_documents(request: SearchRequest):
+    # Generate embedding for the query
+    query_embedding = generate_embedding(request.query)
+    
+    # Search database
+    results = search_similar(
+        embedding=query_embedding,
+        limit=request.limit,
+        min_similarity=request.min_similarity
+    )
+    
+    return SearchResponse(
+        query=request.query,
+        results=[
+            SearchResult(
+                id=r["id"],
+                title=r["title"],
+                content=r["content"],
+                similarity=round(r["similarity"], 4)
+            )
+            for r in results
+        ],
+        total_found=len(results)
+    )
+
+# Stats endpoint
+@app.get("/documents/stats")
+async def document_stats():
+    return {
+        "total_documents": get_document_count(),
+        "database": "postgresql_with_pgvector"
     }
 
 
