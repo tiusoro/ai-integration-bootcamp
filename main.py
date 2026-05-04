@@ -5,11 +5,14 @@ from datetime import datetime
 from memory import memory
 from token_counter import token_counter
 
-
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field, EmailStr, field_validator
 import openai
 from dotenv import load_dotenv
+
+from classifier import classify_intent, SYSTEM_PROMPTS
+from typing import Literal
+
 
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -20,6 +23,67 @@ app = FastAPI(title="AI Integration Bootcamp API", version="0.2.0")
 # ───────────────────────────────────────────────
 # REQUEST MODELS (what clients send us)
 # ───────────────────────────────────────────────
+
+class SupportRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    customer_tier: Literal["free", "pro", "enterprise"] = "free"
+    user_id: str = Field(..., min_length=1)
+
+class SupportResponse(BaseModel):
+    classification: str
+    priority: int  # 1-5
+    answer: str
+    escalation_needed: bool
+    cost_usd: float
+    response_time_ms: float
+
+@app.post("/support", response_model=SupportResponse)
+async def support(request: SupportRequest):
+    start_time = time.time()
+    
+    # Classify intent
+    classification = classify_intent(request.message)
+    
+    # Determine priority based on tier + classification
+    priority_map = {
+        "free": {"billing": 3, "technical": 2, "sales": 1, "general": 1},
+        "pro": {"billing": 4, "technical": 3, "sales": 2, "general": 2},
+        "enterprise": {"billing": 5, "technical": 5, "sales": 4, "general": 3}
+    }
+    priority = priority_map[request.customer_tier][classification]
+    
+    # Build specialized prompt
+    system_prompt = SYSTEM_PROMPTS[classification]
+    if request.customer_tier == "enterprise":
+        system_prompt += " This is an enterprise customer. Provide detailed, immediate solutions."
+    
+    # Call AI with specialized context
+    response = call_openai_with_retry(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.message}
+        ],
+        model="gpt-4o-mini",
+        temperature=0.7,
+        max_tokens=500
+    )
+    
+    answer = response.choices[0].message.content
+    cost = calculate_cost("gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens)
+    escalation_needed = priority >= 4
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return SupportResponse(
+        classification=classification,
+        priority=priority,
+        answer=answer,
+        escalation_needed=escalation_needed,
+        cost_usd=cost,
+        response_time_ms=elapsed_ms
+    )
+
+
 class BudgetChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     user_id: str = Field(..., min_length=1)

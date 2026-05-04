@@ -162,4 +162,37 @@ def test_register_invalid_email():
     })
     assert response.status_code == 422
 
-    
+def test_support_billing():
+    response = client.post("/support", json={
+        "message": "I was charged twice",
+        "user_id": "support-test-1",
+        "customer_tier": "pro"
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["classification"] == "billing"
+    assert data["priority"] == 4
+    assert data["escalation_needed"] is True
+
+def test_support_technical():
+    response = client.post("/support", json={
+        "message": "App crashes on login",
+        "user_id": "support-test-2",
+        "customer_tier": "free"
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["classification"] == "technical"
+    assert data["priority"] == 2
+
+def test_support_enterprise_priority():
+    response = client.post("/support", json={
+        "message": "Need help now",
+        "user_id": "support-test-3",
+        "customer_tier": "enterprise"
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["priority"] == 5
+    assert data["cost_usd"] > 0
+
