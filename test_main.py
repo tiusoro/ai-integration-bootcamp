@@ -187,12 +187,16 @@ def test_support_technical():
 
 def test_support_enterprise_priority():
     response = client.post("/support", json={
-        "message": "Need help now",
+        "message": "Same billing issue",  # Use a clear billing message
         "user_id": "support-test-3",
         "customer_tier": "enterprise"
     })
     assert response.status_code == 200
     data = response.json()
+    assert data["classification"] == "billing"  # Verify classification first
     assert data["priority"] == 5
+    assert data["escalation_needed"] is True
     assert data["cost_usd"] > 0
+
+
 
