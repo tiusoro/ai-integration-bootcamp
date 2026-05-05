@@ -1,6 +1,7 @@
 import time
 import os
-from typing import Literal, Optional, Dict, List
+import json
+from typing import Literal, Optional, Dict, List, Any
 from datetime import datetime
 from memory import memory
 from token_counter import token_counter
@@ -11,7 +12,8 @@ import openai
 from dotenv import load_dotenv
 
 from classifier import classify_intent, SYSTEM_PROMPTS
-from typing import Literal
+from tools import check_inventory, get_order_status, list_products
+
 
 
 load_dotenv()
@@ -260,6 +262,18 @@ INSTRUCTIONS:
         response_time_ms=elapsed_ms
     )
 
+# Added on Day 9
+class FunctionChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+    user_id: str = Field(..., min_length=1)
+    model: Literal["gpt-4o-mini", "gpt-4o"] = "gpt-4o-mini"
+
+class FunctionChatResponse(BaseModel):
+    answer: str
+    function_called: Optional[str] = None
+    function_result: Optional[Any] = None
+    cost_usd: float
+    response_time_ms: float
 
 
 # ───────────────────────────────────────────────
@@ -704,5 +718,120 @@ async def document_stats():
         "database": "postgresql_with_pgvector"
     }
 
+# Added on Day 9
+AVAILABLE_FUNCTIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inventory",
+            "description": "Check if a product is in stock and get pricing",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "description": "Product identifier (e.g., 'iphone-15', 'macbook-air')"
+                    }
+                },
+                "required": ["product_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_order_status",
+            "description": "Get the shipping status and tracking info for an order",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Order identifier (e.g., 'order-123')"
+                    }
+                },
+                "required": ["order_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_products",
+            "description": "List all available products with prices and stock status",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+]
 
+
+@app.post("/chat/functions", response_model=FunctionChatResponse)
+async def chat_with_functions(request: FunctionChatRequest):
+    start_time = time.time()
+    
+    messages = [
+        {"role": "system", "content": "You are a helpful store assistant. Use the available functions to help customers."},
+        {"role": "user", "content": request.message}
+    ]
+    
+    response = client.chat.completions.create(
+        model=request.model,
+        messages=messages,
+        tools=AVAILABLE_FUNCTIONS,
+        tool_choice="auto",
+        temperature=0.3
+    )
+    
+    message = response.choices[0].message
+    
+    if message.tool_calls:
+        tool_call = message.tool_calls[0]
+        function_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+        
+        if function_name == "check_inventory":
+            result = check_inventory(**arguments)
+        elif function_name == "get_order_status":
+            result = get_order_status(**arguments)
+        elif function_name == "list_products":
+            result = list_products()
+        else:
+            result = {"error": f"Unknown function: {function_name}"}
+        
+        messages.append(message)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": json.dumps(result)
+        })
+        
+        final_response = client.chat.completions.create(
+            model=request.model,
+            messages=messages,
+            temperature=0.7
+        )
+        
+        answer = final_response.choices[0].message.content
+        cost = calculate_cost(request.model, 
+            response.usage.prompt_tokens + final_response.usage.prompt_tokens,
+            response.usage.completion_tokens + final_response.usage.completion_tokens
+        )
+    else:
+        answer = message.content
+        cost = calculate_cost(request.model, response.usage.prompt_tokens, response.usage.completion_tokens)
+        result = None
+        function_name = None
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return FunctionChatResponse(
+        answer=answer,
+        function_called=function_name,
+        function_result=result,
+        cost_usd=cost,
+        response_time_ms=elapsed_ms
+    )
 
