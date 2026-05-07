@@ -799,7 +799,7 @@ async def chat_with_functions(request: FunctionChatRequest):
     start_time = time.time()
     
     messages = [
-        {"role": "system", "content": "You are a helpful store assistant. Do use the available functions to help customers."},
+        {"role": "system", "content": "You are a helpful store assistant. Use the available functions to help customers."},
         {"role": "user", "content": request.message}
     ]
     
