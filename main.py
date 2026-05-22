@@ -3,6 +3,7 @@ import os
 import json
 from typing import Literal, Optional, Dict, List, Any
 from datetime import datetime
+from contextlib import asynccontextmanager
 from memory import memory
 from token_counter import token_counter
 
@@ -617,9 +618,12 @@ from typing import List
 import openai
 
 # Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager  # NEW, correct
+async def lifespan(app: FastAPI):
+    print("🚀 Starting up... Initializing database")
     init_db()
+    yield
+
 
 # Request/Response models
 class DocumentIngestRequest(BaseModel):
