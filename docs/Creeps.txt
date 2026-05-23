@@ -1,0 +1,8 @@
+| Add-on                     | Description                         | Price  | Time     |
+| -------------------------- | ----------------------------------- | ------ | -------- |
+| **WhatsApp Business API**  | AI bot replies via WhatsApp         | +\$800 | 2 days   |
+| **Slack integration**      | Bot lives in Slack channel          | +\$600 | 1-2 days |
+| **Discord bot**            | AI responses in Discord server      | +\$500 | 1 day    |
+| **Telegram bot**           | AI via Telegram messaging           | +\$500 | 1 day    |
+| **Email auto-responder**   | AI drafts replies to support emails | +\$700 | 2 days   |
+| **SMS/Twilio integration** | Text message AI responses           | +\$900 | 2-3 days |

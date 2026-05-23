@@ -612,7 +612,7 @@ async def chat_stream(request: ChatRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# ADDED IN PHASE 2 DAY 7 
+# ADDED IN DAY 7 
 from database import init_db, insert_document, search_similar, get_document_count
 from typing import List
 import openai
