@@ -3,6 +3,14 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 import json
 import os
+import openai
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize OpenAI client
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # -- WHISPER API INTEGRATION --
 

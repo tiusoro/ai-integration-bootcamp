@@ -27,7 +27,7 @@ from transcription import (
     transcribe_audio, extract_meeting_intelligence,
     generate_crm_updates, generate_calendar_reminders
 )
-from crm import CRM_CONTACTS
+
 
 import time
 
@@ -1081,7 +1081,7 @@ async def process_meeting(request: TranscriptionRequest):
     # Step 1: Get transcript (audio or text)
     if request.audio_url and os.path.exists(request.audio_url):
         transcript = transcribe_audio(request.audio_url, request.language)
-        audio_seconds = None  # Would calculate from file
+        audio_seconds = None
     elif request.audio_text:
         transcript = request.audio_text
         audio_seconds = None
@@ -1107,13 +1107,12 @@ async def process_meeting(request: TranscriptionRequest):
     calendar_reminders = generate_calendar_reminders(intelligence, contact["name"])
     
     # Calculate costs
-    transcript_cost = 0.0  # Whisper: $0.006/minute (would calculate from audio length)
     extraction_cost = calculate_cost(
         "gpt-4o-mini",
-        len(transcript.split()) // 4,  # Approximate tokens
+        len(transcript.split()) // 4,
         len(str(intelligence).split()) // 4
     )
-    total_cost = round(transcript_cost + extraction_cost, 6)
+    total_cost = round(extraction_cost, 6)
     
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
     
@@ -1135,8 +1134,6 @@ async def process_meeting(request: TranscriptionRequest):
 @app.get("/crm/meeting/{contact_id}/history")
 async def get_meeting_history(contact_id: str):
     """Get all processed meetings for a contact."""
-    # In production, this would query a meetings table
-    # For now, return mock data
     contact = CRM_CONTACTS.get(contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
@@ -1148,5 +1145,3 @@ async def get_meeting_history(contact_id: str):
         "last_meeting": contact.get("last_contact"),
         "note": "In production, this queries a meetings database table"
     }
-
-
