@@ -35,6 +35,14 @@ from shopify import (
     generate_recommendations, generate_recovery_email
 )
 
+from analytics import (
+    NLQueryRequest, NLQueryResponse,
+    DashboardMetrics,
+    generate_sql, validate_sql, execute_mock_sql,
+    calculate_dashboard_metrics,
+    DATABASE_SCHEMA
+)
+
 
 
 import time
@@ -1273,4 +1281,79 @@ async def recover_cart(request: CartRecoveryRequest):
         estimated_recovery_value=cart["total"],
         cost_usd=cost
     )
+
+# =====================Day 18 =====================================================
+@app.post("/analytics/query", response_model=NLQueryResponse)
+async def natural_language_query(request: NLQueryRequest):
+    """Convert natural language to SQL, validate, execute with permissions."""
+    start_time = time.time()
+    
+    # Step 1: Generate SQL from natural language
+    sql = generate_sql(request.question, DATABASE_SCHEMA, request.user_role)
+    
+    # Step 2: Validate SQL safety
+    is_safe, warning = validate_sql(sql)
+    if not is_safe:
+        return NLQueryResponse(
+            question=request.question,
+            generated_sql=sql,
+            sql_safe=False,
+            results=[],
+            result_count=0,
+            execution_time_ms=0,
+            cost_usd=0,
+            warning=warning
+        )
+    
+    # Step 3: Execute with permission filtering
+    results = execute_mock_sql(sql, request.user_id, request.user_role)
+    
+    # Calculate cost (approximate)
+    cost = calculate_cost("gpt-4o-mini", len(request.question.split()) // 4, len(sql.split()) // 4)
+    
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return NLQueryResponse(
+        question=request.question,
+        generated_sql=sql,
+        sql_safe=True,
+        results=results,
+        result_count=len(results),
+        execution_time_ms=elapsed_ms,
+        cost_usd=cost,
+        warning=None
+    )
+
+@app.get("/analytics/dashboard")
+async def get_dashboard():
+    """Get admin dashboard metrics. Admin only in production."""
+    return calculate_dashboard_metrics()
+
+@app.get("/analytics/dashboard/chart/{metric}")
+async def get_chart_data(metric: str):
+    """Get chart-ready data for specific metric."""
+    if metric == "revenue_by_month":
+        data = execute_mock_sql(
+            "SELECT strftime('%Y-%m', created_at) as month, SUM(amount) as total FROM orders GROUP BY month",
+            user_id=None,
+            user_role="admin"
+        )
+        return {"chart_type": "bar", "data": data, "x_key": "month", "y_key": "total"}
+    elif metric == "user_growth":
+        data = execute_mock_sql(
+            "SELECT strftime('%Y-%m', created_at) as month, COUNT(*) as count FROM users GROUP BY month",
+            user_id=None,
+            user_role="admin"
+        )
+        return {"chart_type": "line", "data": data, "x_key": "month", "y_key": "count"}
+    elif metric == "subscription_distribution":
+        tiers = {}
+        for u in MOCK_USERS:
+            tier = u["subscription_tier"]
+            tiers[tier] = tiers.get(tier, 0) + 1
+        data = [{"tier": k, "count": v} for k, v in tiers.items()]
+        return {"chart_type": "pie", "data": data, "label_key": "tier", "value_key": "count"}
+    else:
+        raise HTTPException(status_code=404, detail="Metric not found")
+    
 
