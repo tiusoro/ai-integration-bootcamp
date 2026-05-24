@@ -15,6 +15,15 @@ from dotenv import load_dotenv
 from classifier import classify_intent, SYSTEM_PROMPTS
 from tools import check_inventory, get_order_status, list_products
 
+from crm import (
+    calculate_lead_score, LeadScore,
+    build_email_context, EmailDraftRequest, EmailDraftResponse,
+    CRM_CONTACTS,
+    MeetingTranscribeRequest
+)
+import time
+
+
 
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -905,4 +914,152 @@ async def analyze_image(request: ImageAnalysisRequest):
         cost_usd=cost
     )
 
+#====================Day 15==============================================================
+
+@app.get("/crm/leads/{lead_id}/score", response_model=LeadScore)
+async def get_lead_score(lead_id: str):
+    """Get AI-calculated lead quality score with actionable recommendation."""
+    return calculate_lead_score(lead_id)
+
+@app.post("/crm/leads/{lead_id}/email", response_model=EmailDraftResponse)
+async def draft_email(lead_id: str, request: EmailDraftRequest):
+    """Generate personalized email using lead context and AI."""
+    start_time = time.time()
+    
+    # Build context from CRM
+    context = build_email_context(lead_id)
+    contact = CRM_CONTACTS.get(lead_id)
+    
+    # Build system prompt based on email type
+    email_prompts = {
+        "follow_up": "You are a sales follow-up specialist. Write a warm, personalized follow-up email.",
+        "cold_outreach": "You are a B2B sales development rep. Write a compelling cold email that gets a response.",
+        "demo_request": "You are a solutions consultant. Write an email to schedule a product demo.",
+        "proposal": "You are an account executive. Write an email presenting a tailored proposal."
+    }
+    
+    tone_instructions = {
+        "professional": "Use formal business language. Clear, concise, respectful.",
+        "friendly": "Use warm, conversational tone. Build rapport.",
+        "urgent": "Create gentle urgency. Limited time offer or competitive pressure."
+    }
+    
+    system_prompt = f"""{email_prompts[request.email_type]}
+TONE: {tone_instructions[request.tone]}
+RULES:
+1. Reference specific pain points from the lead profile
+2. Mention recent activity (page views, downloads) naturally
+3. Keep under {request.max_length_words} words
+4. {'Include clear call-to-action' if request.include_cta else 'No call-to-action, just value'}
+5. Subject line should be compelling and specific"""
+    
+    # Generate email with AI
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"Write an email to this lead:\n\n{context}"}
+    ]
+    
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=800
+    )
+    
+    email_text = response.choices[0].message.content
+    
+    # Extract subject line (first line if it starts with "Subject:")
+    lines = email_text.split('\n')
+    subject = "Follow-up"
+    body = email_text
+    for line in lines:
+        if line.lower().startswith('subject:'):
+            subject = line.replace('Subject:', '').strip()
+            body = '\n'.join(lines[lines.index(line)+1:]).strip()
+            break
+    
+    # Identify personalization signals used
+    personalization = []
+    if any(pain in email_text.lower() for pain in contact["pain_points"]):
+        personalization.append("referenced pain points")
+    if contact["company"] in email_text:
+        personalization.append("mentioned company name")
+    if contact["interactions"] and any(i["date"] in email_text for i in contact["interactions"]):
+        personalization.append("referenced recent activity")
+    
+    cost = calculate_cost("gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens)
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    
+    return EmailDraftResponse(
+        lead_id=lead_id,
+        recipient={"name": contact["name"], "email": contact["email"], "company": contact["company"]},
+        subject=subject,
+        body=body,
+        tone=request.tone,
+        word_count=len(email_text.split()),
+        personalization_signals=personalization,
+        cost_usd=cost,
+        generated_at=datetime.now().isoformat()
+    )
+
+@app.get("/crm/leads")
+async def list_leads():
+    """List all leads with basic info and scores."""
+    results = []
+    for lead_id, contact in CRM_CONTACTS.items():
+        score = calculate_lead_score(lead_id)
+        results.append({
+            "lead_id": lead_id,
+            "name": contact["name"],
+            "company": contact["company"],
+            "status": contact["status"],
+            "score": score.score,
+            "priority": score.priority,
+            "last_contact": contact["last_contact"]
+        })
+    return {"leads": results, "total": len(results)}
+
+@app.post("/crm/meeting/transcribe")
+async def transcribe_meeting(request: MeetingTranscribeRequest):
+    """Mock meeting transcription → extract action items → CRM update suggestions."""
+    start_time = time.time()
+    
+    system_prompt = """You are a meeting intelligence assistant.
+Extract from this meeting transcript:
+1. Key decisions made
+2. Action items with owners
+3. Follow-up dates
+4. Sentiment (positive/neutral/negative)
+5. CRM updates needed
+
+Return as structured JSON."""
+    
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.meeting_text}
+        ],
+        temperature=0.3,
+        max_tokens=1000
+    )
+    
+    # Parse AI response
+    try:
+        result = json.loads(response.choices[0].message.content)
+    except json.JSONDecodeError:
+        result = {
+            "raw_analysis": response.choices[0].message.content,
+            "note": "AI returned non-JSON. Parse manually."
+        }
+    
+    cost = calculate_cost("gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens)
+    
+    return {
+        "transcript_length": len(request.meeting_text),
+        "analysis": result,
+        "crm_updates_suggested": result.get("crm_updates_needed", []),
+        "cost_usd": cost,
+        "processing_time_ms": round((time.time() - start_time) * 1000, 2)
+    }
 
