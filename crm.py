@@ -142,7 +142,6 @@ def calculate_lead_score(lead_id: str) -> LeadScore:
 # -- EMAIL DRAFTING ENGINE --
 
 class EmailDraftRequest(BaseModel):
-    lead_id: str = Field(..., min_length=1)
     email_type: Literal["follow_up", "cold_outreach", "demo_request", "proposal"] = "follow_up"
     tone: Literal["professional", "friendly", "urgent"] = "professional"
     max_length_words: int = Field(200, ge=50, le=500)
