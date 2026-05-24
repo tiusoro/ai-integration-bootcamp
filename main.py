@@ -28,6 +28,14 @@ from transcription import (
     generate_crm_updates, generate_calendar_reminders
 )
 
+from shopify import (
+    SHOPIFY_PRODUCTS, SHOPIFY_ORDERS, SHOPIFY_CARTS,
+    RecommendationRequest, RecommendationResponse,
+    CartRecoveryRequest, CartRecoveryResponse,
+    generate_recommendations, generate_recovery_email
+)
+
+
 
 import time
 
@@ -1145,3 +1153,124 @@ async def get_meeting_history(contact_id: str):
         "last_meeting": contact.get("last_contact"),
         "note": "In production, this queries a meetings database table"
     }
+
+
+# =====================Day 17======================================================
+# -- PRODUCT ENDPOINTS --
+
+@app.get("/shopify/products")
+async def list_products():
+    """List all Shopify products with inventory status."""
+    products = []
+    for prod_id, product in SHOPIFY_PRODUCTS.items():
+        products.append({
+            "id": prod_id,
+            "title": product["title"],
+            "price": product["price"],
+            "compare_at_price": product["compare_at_price"],
+            "inventory": product["inventory_quantity"],
+            "status": "in_stock" if product["inventory_quantity"] > 0 else "out_of_stock",
+            "tags": product["tags"]
+        })
+    return {"products": products, "total": len(products)}
+
+@app.get("/shopify/products/{product_id}")
+async def get_product(product_id: str):
+    """Get single product details."""
+    product = SHOPIFY_PRODUCTS.get(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
+
+@app.post("/shopify/recommend", response_model=RecommendationResponse)
+async def get_recommendations(request: RecommendationRequest):
+    """Get personalized product recommendations."""
+    return generate_recommendations(request)
+
+# -- ORDER TRACKING --
+
+@app.get("/shopify/orders/{order_id}")
+async def track_order(order_id: str):
+    """Track order status and shipping."""
+    order = SHOPIFY_ORDERS.get(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Calculate delivery estimate
+    created = datetime.strptime(order["created_at"], "%Y-%m-%d")
+    if order["fulfillment_status"] == "fulfilled":
+        delivery_estimate = "Delivered or in transit"
+    else:
+        delivery_estimate = "Processing - ships within 2 business days"
+    
+    return {
+        "order_id": order_id,
+        "status": order["fulfillment_status"],
+        "financial_status": order["financial_status"],
+        "total": order["total_price"],
+        "items": [SHOPIFY_PRODUCTS.get(item_id, {"title": "Unknown"})["title"] for item_id in order["line_items"]],
+        "tracking_number": order["tracking_number"],
+        "delivery_estimate": delivery_estimate,
+        "shipping_to": order["shipping_address"]
+    }
+
+# -- ABANDONED CART RECOVERY --
+
+@app.post("/shopify/cart/recover", response_model=CartRecoveryResponse)
+async def recover_cart(request: CartRecoveryRequest):
+    """Generate abandoned cart recovery email."""
+    start_time = time.time()
+    
+    cart = SHOPIFY_CARTS.get(request.cart_id)
+    if not cart:
+        raise HTTPException(status_code=404, detail="Cart not found")
+    
+    # Generate email content
+    email_data = generate_recovery_email(cart, request.tone, request.include_discount, request.discount_percent)
+    
+    # Call AI for email generation
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": email_data["system_prompt"]},
+            {"role": "user", "content": email_data["user_content"]}
+        ],
+        temperature=0.7,
+        max_tokens=500
+    )
+    
+    email_text = response.choices[0].message.content
+    
+    # Extract subject (first line if starts with Subject:)
+    lines = email_text.split('\n')
+    subject = "You left something behind..."
+    body = email_text
+    for line in lines:
+        if line.lower().startswith('subject:'):
+            subject = line.replace('Subject:', '').strip()
+            body = '\n'.join(lines[lines.index(line)+1:]).strip()
+            break
+    
+    # Calculate urgency
+    abandoned_time = datetime.fromisoformat(cart["abandoned_at"].replace('Z', '+00:00'))
+    hours_abandoned = (datetime.now() - abandoned_time).total_seconds() / 3600
+    urgency_score = min(10, int(hours_abandoned / 2) + 3)
+    
+    # Generate discount code if requested
+    discount_code = None
+    if request.include_discount:
+        discount_code = f"SAVE{request.discount_percent}-{request.cart_id[:4].upper()}"
+    
+    cost = calculate_cost("gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens)
+    
+    return CartRecoveryResponse(
+        cart_id=request.cart_id,
+        customer_email=cart["customer_email"],
+        subject=subject,
+        email_body=body,
+        urgency_score=urgency_score,
+        discount_code=discount_code,
+        estimated_recovery_value=cart["total"],
+        cost_usd=cost
+    )
+
