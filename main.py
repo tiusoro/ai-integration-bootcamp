@@ -1,8 +1,9 @@
 import time
 import os
 import json
+import time
 from typing import Literal, Optional, Dict, List, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from memory import memory
 from token_counter import token_counter
@@ -60,10 +61,19 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from typing import Dict, Any, List, Optional  
 from analytics import DashboardMetrics, calculate_dashboard_metrics
 
+# Day 20 imports
+from monitoring import (
+    TimingMiddleware, logger, record_error, record_cost,
+    get_performance_metrics, get_error_summary, get_cost_summary, get_health_status,
+    init_monitoring_tables
+)
+from alerting import send_alert
 
 
 
-import time
+
+
+
 
 
 
@@ -77,6 +87,10 @@ app = FastAPI(
     version="19.0.0"
 )
 
+# Add timing middleware
+# Initialize monitoring tables on startup
+init_monitoring_tables()
+app.add_middleware(TimingMiddleware)
 
 
 # ───────────────────────────────────────────────
@@ -1464,3 +1478,39 @@ async def rate_limit_status(user: Dict[str, Any] = Depends(get_current_user_or_a
 async def auth_test():
     return {"status": "auth routes are working"}
 
+# ====================================Day 20 =============================================
+@app.get("/health", tags=["Monitoring"])
+async def health_check():
+    return get_health_status()
+
+# ═══════════════════════════════════════════════
+# DAY 20: Monitoring & Logging
+# ═══════════════════════════════════════════════
+
+@app.get("/monitoring/performance", tags=["Monitoring"])
+async def performance_metrics(user: Dict[str, Any] = Depends(require_admin)):
+    return get_performance_metrics()
+
+@app.get("/monitoring/errors", tags=["Monitoring"])
+async def error_logs(limit: int = 50, user: Dict[str, Any] = Depends(require_admin)):
+    return {
+        "errors": get_error_summary(limit),
+        "total_recorded": len(get_error_summary(10000)),
+        "generated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.get("/monitoring/costs", tags=["Monitoring"])
+async def cost_metrics(user: Dict[str, Any] = Depends(require_admin)):
+    return get_cost_summary()
+
+@app.post("/monitoring/alert", tags=["Monitoring"])
+async def test_alert(
+    message: str = "Test alert from AI Bootcamp",
+    user: Dict[str, Any] = Depends(require_admin)
+):
+    results = send_alert(message, details={"source": "test_endpoint", "user": user["email"]})
+    return {
+        "message": message,
+        "channels_attempted": results,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
