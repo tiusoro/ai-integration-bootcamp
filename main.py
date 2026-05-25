@@ -69,6 +69,15 @@ from monitoring import (
 )
 from alerting import send_alert
 
+# Day 21 imports
+from tenant import (
+    TenantCreateRequest, TenantResponse, TenantUserAssignRequest, TenantSwitchRequest,
+    get_current_tenant, init_tenant_tables, _get_tenant_with_membership, 
+    create_tenant, list_tenants, assign_user_to_tenant, switch_user_tenant,
+    get_tenant_usage, set_tenant_context
+)
+
+
 
 
 
@@ -91,6 +100,10 @@ app = FastAPI(
 # Initialize monitoring tables on startup
 init_monitoring_tables()
 app.add_middleware(TimingMiddleware)
+
+# Initialize tenant tables on startup
+init_tenant_tables()
+
 
 
 # ───────────────────────────────────────────────
@@ -1514,3 +1527,97 @@ async def test_alert(
         "channels_attempted": results,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+# ===========================Day 21======================================================
+# ═══════════════════════════════════════════════
+# DAY 21: Multi-Tenant Architecture
+# ═══════════════════════════════════════════════
+
+@app.post("/tenants", response_model=Dict[str, Any], tags=["Tenants"])
+async def create_new_tenant(
+    request: TenantCreateRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Create a new tenant (organization/workspace).
+    Creator is automatically assigned as admin.
+    """
+    tenant = create_tenant(request, user["id"])
+    return {
+        "message": "Tenant created successfully",
+        "tenant": tenant
+    }
+
+@app.get("/tenants", response_model=List[TenantResponse], tags=["Tenants"])
+async def get_tenants(
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    List tenants you belong to. Admins see all tenants.
+    """
+    is_admin = user["role"] == "admin"
+    return list_tenants(user["id"], is_admin)
+
+@app.get("/tenants/me", tags=["Tenants"])
+async def get_my_tenant(
+    tenant: Dict[str, Any] = Depends(get_current_tenant)
+):
+    """
+    Get current tenant context.
+    """
+    return tenant
+
+@app.post("/tenants/{tenant_id}/users", tags=["Tenants"])
+async def add_user_to_tenant(
+    tenant_id: str,
+    request: TenantUserAssignRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Assign a user to a tenant. Only tenant admins can do this.
+    """
+    # Verify caller is admin of this tenant
+    tenant = _get_tenant_with_membership(tenant_id, user["id"])
+    if not tenant or tenant["user_role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only tenant admins can add users."
+        )
+    
+    assign_user_to_tenant(tenant_id, request.user_id, request.role)
+    return {
+        "message": "User assigned to tenant successfully",
+        "tenant_id": tenant_id,
+        "user_id": request.user_id,
+        "role": request.role
+    }
+
+@app.post("/tenants/switch", tags=["Tenants"])
+async def switch_tenant(
+    request: TenantSwitchRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Switch to a different tenant.
+    """
+    return switch_user_tenant(user["id"], request.tenant_id)
+
+@app.get("/tenants/{tenant_id}/usage", tags=["Tenants"])
+async def tenant_usage(
+    tenant_id: str,
+    days: int = 30,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Get usage metrics for billing (request count, cost, active users).
+    """
+    # Verify membership
+    tenant = _get_tenant_with_membership(tenant_id, user["id"])
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not a member of this tenant."
+        )
+    
+    return get_tenant_usage(tenant_id, days)
+
