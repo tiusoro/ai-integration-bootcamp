@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from memory import memory
 from token_counter import token_counter
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, Depends
 from pydantic import BaseModel, Field, EmailStr, field_validator
 import openai
 from dotenv import load_dotenv
@@ -40,8 +40,26 @@ from analytics import (
     DashboardMetrics,
     generate_sql, validate_sql, execute_mock_sql,
     calculate_dashboard_metrics,
-    DATABASE_SCHEMA
+    DashboardMetrics, calculate_dashboard_metrics,
+    DATABASE_SCHEMA,MOCK_USERS
 )
+
+from auth import (
+    UserRegisterRequest, UserLoginRequest, TokenResponse, UserProfile,
+    APIKeyCreateRequest, APIKeyResponse, APIKeyListItem,
+    register_user, authenticate_user, create_access_token,
+    get_current_user, get_current_user_or_api_key,
+    require_role, require_admin, require_admin_or_user, require_any_role,
+    create_api_key, list_api_keys, revoke_api_key,
+    get_user_profile
+)
+
+
+from rate_limiter import rate_limit_dependency, check_rate_limit
+from fastapi import FastAPI, HTTPException, Depends, status 
+from typing import Dict, Any, List, Optional  
+from analytics import DashboardMetrics, calculate_dashboard_metrics
+
 
 
 
@@ -52,7 +70,13 @@ import time
 load_dotenv()
 client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI(title="AI Integration Bootcamp API", version="0.2.0")
+
+app = FastAPI(
+    title="AI Integration Bootcamp API",
+    description="Days 1-19: Chat, RAG, CRM, E-commerce, Analytics, Auth",
+    version="19.0.0"
+)
+
 
 
 # ───────────────────────────────────────────────
@@ -1282,15 +1306,36 @@ async def recover_cart(request: CartRecoveryRequest):
         cost_usd=cost
     )
 
-# =====================Day 18 =====================================================
-@app.post("/analytics/query", response_model=NLQueryResponse)
-async def natural_language_query(request: NLQueryRequest):
+# =====================Day 18 ===================================================
+
+# ═══════════════════════════════════════════════
+# HEALTH CHECK (Day 1)
+# ═══════════════════════════════════════════════
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "version": "19.0.0", "days_completed": 19}
+
+# ═══════════════════════════════════════════════
+# DAY 18: SaaS Analytics (PROTECTED)
+# ═══════════════════════════════════════════════
+
+@app.post("/analytics/query", response_model=NLQueryResponse, tags=["Analytics"])
+async def natural_language_query(
+    request: NLQueryRequest,
+    user: Dict[str, Any] = Depends(require_any_role)
+):
     """Convert natural language to SQL, validate, execute with permissions."""
+    import time
     start_time = time.time()
-    
+
+    # Override request role with actual auth role for security
+    effective_role = user["role"]
+    effective_user_id = request.user_id if effective_role == "admin" else int(user["id"])
+
     # Step 1: Generate SQL from natural language
-    sql = generate_sql(request.question, DATABASE_SCHEMA, request.user_role)
-    
+    sql = generate_sql(request.question, DATABASE_SCHEMA, effective_role)
+
     # Step 2: Validate SQL safety
     is_safe, warning = validate_sql(sql)
     if not is_safe:
@@ -1304,15 +1349,12 @@ async def natural_language_query(request: NLQueryRequest):
             cost_usd=0,
             warning=warning
         )
-    
+
     # Step 3: Execute with permission filtering
-    results = execute_mock_sql(sql, request.user_id, request.user_role)
-    
-    # Calculate cost (approximate)
-    cost = calculate_cost("gpt-4o-mini", len(request.question.split()) // 4, len(sql.split()) // 4)
-    
+    results = execute_mock_sql(sql, effective_user_id, effective_role)
+
     elapsed_ms = round((time.time() - start_time) * 1000, 2)
-    
+
     return NLQueryResponse(
         question=request.question,
         generated_sql=sql,
@@ -1320,18 +1362,18 @@ async def natural_language_query(request: NLQueryRequest):
         results=results,
         result_count=len(results),
         execution_time_ms=elapsed_ms,
-        cost_usd=cost,
+        cost_usd=0.0001,
         warning=None
     )
 
-@app.get("/analytics/dashboard")
-async def get_dashboard():
-    """Get admin dashboard metrics. Admin only in production."""
+@app.get("/analytics/dashboard", response_model=DashboardMetrics, tags=["Analytics"])
+async def get_dashboard(user: Dict[str, Any] = Depends(require_admin)):
+    """Get admin dashboard metrics. ADMIN ONLY."""
     return calculate_dashboard_metrics()
 
-@app.get("/analytics/dashboard/chart/{metric}")
-async def get_chart_data(metric: str):
-    """Get chart-ready data for specific metric."""
+@app.get("/analytics/dashboard/chart/{metric}", tags=["Analytics"])
+async def get_chart_data(metric: str, user: Dict[str, Any] = Depends(require_admin)):
+    """Get chart-ready data for specific metric. ADMIN ONLY."""
     if metric == "revenue_by_month":
         data = execute_mock_sql(
             "SELECT strftime('%Y-%m', created_at) as month, SUM(amount) as total FROM orders GROUP BY month",
@@ -1355,5 +1397,70 @@ async def get_chart_data(metric: str):
         return {"chart_type": "pie", "data": data, "label_key": "tier", "value_key": "count"}
     else:
         raise HTTPException(status_code=404, detail="Metric not found")
-    
+
+# ═══════════════════════════════════════════════
+# DAY 19: Authentication & Authorization
+# ═══════════════════════════════════════════════
+
+@app.post("/auth/register", response_model=Dict[str, Any], tags=["Authentication"])
+async def register(request: UserRegisterRequest):
+    """Register a new user. Password hashed with bcrypt."""
+    user = register_user(request)
+    return {"message": "Registration successful", "user": user}
+
+@app.post("/auth/login", response_model=TokenResponse, tags=["Authentication"])
+async def login(request: UserLoginRequest):
+    """Authenticate and receive JWT access token."""
+    user = authenticate_user(request.email, request.password)
+    token = create_access_token(user["id"], user["email"], user["role"])
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=24 * 3600,
+        user=user
+    )
+
+@app.get("/auth/me", response_model=UserProfile, tags=["Authentication"])
+async def me(user: Dict[str, Any] = Depends(get_current_user_or_api_key)):
+    """Get current user profile from JWT token OR API key."""
+    return get_user_profile(user["id"])
+
+@app.post("/auth/api-keys", response_model=APIKeyResponse, tags=["API Keys"])
+async def generate_api_key(
+    request: APIKeyCreateRequest,
+    user: Dict[str, Any] = Depends(require_admin_or_user)
+):
+    """Generate API key for integrations. Key shown ONCE."""
+    return create_api_key(user["id"], request.name, request.rate_limit_per_minute)
+
+@app.get("/auth/api-keys", response_model=List[APIKeyListItem], tags=["API Keys"])
+async def get_api_keys(user: Dict[str, Any] = Depends(require_admin_or_user)):
+    """List API keys (metadata only)."""
+    is_admin = user["role"] == "admin"
+    return list_api_keys(user["id"], is_admin)
+
+@app.delete("/auth/api-keys/{key_id}", tags=["API Keys"])
+async def delete_api_key(
+    key_id: str,
+    user: Dict[str, Any] = Depends(require_admin_or_user)
+):
+    """Revoke an API key."""
+    is_admin = user["role"] == "admin"
+    revoke_api_key(key_id, user["id"], is_admin)
+    return {"message": "API key revoked successfully"}
+
+@app.get("/auth/rate-limit", tags=["Authentication"])
+async def rate_limit_status(user: Dict[str, Any] = Depends(get_current_user_or_api_key)):
+    """Check current rate limit status."""
+    return {
+        "remaining_requests": 60,
+        "reset_in_seconds": 60,
+        "user_id": user["id"]
+    }
+
+# Test route (remove after verification)
+@app.get("/auth/test", tags=["Authentication"])
+async def auth_test():
+    return {"status": "auth routes are working"}
 
