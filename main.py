@@ -77,12 +77,14 @@ from tenant import (
     get_tenant_usage, set_tenant_context
 )
 
-
-
-
-
-
-
+# Day 22 imports
+from agent_engine import (
+    AgentRunRequest, AgentApprovalRequest, AgentStatusResponse,
+    AgentState, init_agent_tables, create_agent_run, get_agent_status,
+    run_agent_workflow, approve_and_continue, WORKFLOWS
+)
+# At the top of main.py, ensure this import exists:
+from database import get_connection
 
 
 
@@ -104,6 +106,8 @@ app.add_middleware(TimingMiddleware)
 # Initialize tenant tables on startup
 init_tenant_tables()
 
+# Initialize agent tables on startup
+init_agent_tables()
 
 
 # ───────────────────────────────────────────────
@@ -1491,7 +1495,7 @@ async def rate_limit_status(user: Dict[str, Any] = Depends(get_current_user_or_a
 async def auth_test():
     return {"status": "auth routes are working"}
 
-# ====================================Day 20 =============================================
+# ====================================Day20=============================================
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
     return get_health_status()
@@ -1620,4 +1624,134 @@ async def tenant_usage(
         )
     
     return get_tenant_usage(tenant_id, days)
+
+
+
+# ==================================Day22===================================================
+# ═══════════════════════════════════════════════
+# DAY 22: Agent Architecture
+# ═══════════════════════════════════════════════
+
+@app.post("/agents/run", response_model=Dict[str, Any], tags=["Agents"])
+async def start_agent(
+    request: AgentRunRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Start a multi-step agent workflow.
+    
+    Example: {"workflow_name": "content_creation", "input_data": {"topic": "AI in healthcare"}}
+    """
+    if request.workflow_name not in WORKFLOWS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown workflow. Available: {list(WORKFLOWS.keys())}"
+        )
+    
+    run_id = create_agent_run(request.workflow_name, request.input_data, user["id"])
+    
+    # Run workflow (synchronous for bootcamp; async background task in production)
+    run_agent_workflow(run_id)
+    
+    status = get_agent_status(run_id)
+    
+    return {
+        "message": "Agent workflow started",
+        "run_id": run_id,
+        "workflow_name": request.workflow_name,
+        "state": status["state"],
+        "current_step": status["current_step"]
+    }
+
+@app.get("/agents/{run_id}/status", response_model=AgentStatusResponse, tags=["Agents"])
+async def get_agent_status_endpoint(
+    run_id: str,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Check current status of an agent run.
+    """
+    status = get_agent_status(run_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    
+    return AgentStatusResponse(
+        run_id=status["run_id"],
+        workflow_name=status["workflow_name"],
+        state=status["state"],
+        current_step=status["current_step"],
+        completed_steps=status["completed_steps"],
+        failed_steps=status["failed_steps"],
+        results=status["results"],
+        started_at=status["started_at"],
+        updated_at=status["updated_at"],
+        waiting_for_approval=status["waiting_for_approval"]
+    )
+
+@app.post("/agents/{run_id}/approve", tags=["Agents"])
+async def approve_agent_step(
+    run_id: str,
+    request: AgentApprovalRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Approve or reject a paused agent step.
+    True = continue, False = cancel.
+    """
+    try:
+        result = approve_and_continue(run_id, request.approved, request.feedback)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/agents/{run_id}/cancel", tags=["Agents"])
+async def cancel_agent(
+    run_id: str,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Cancel a running or paused agent.
+    """
+    from database import get_connection  # Local import as fallback
+    
+    status = get_agent_status(run_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    
+    if status["state"] not in ["running", "paused", "idle"]:
+        raise HTTPException(status_code=400, detail=f"Cannot cancel agent in state: {status['state']}")
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    cursor.execute("""
+        UPDATE agent_runs SET state = %s, updated_at = %s, current_step = NULL
+        WHERE id = %s
+    """, ("cancelled", now, run_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    return {"message": "Agent run cancelled", "run_id": run_id}
+
+
+@app.get("/agents/workflows", tags=["Agents"])
+async def list_workflows():
+    """
+    List available predefined workflows and their steps.
+    """
+    return {
+        "workflows": {
+            name: [
+                {
+                    "name": step.name,
+                    "description": step.description,
+                    "requires_approval": step.requires_approval
+                }
+                for step in steps
+            ]
+            for name, steps in WORKFLOWS.items()
+        }
+    }
+
 
