@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from memory import memory
 from token_counter import token_counter
 
-from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status, Depends, Request
 from pydantic import BaseModel, Field, EmailStr, field_validator
 import openai
 from dotenv import load_dotenv
@@ -86,6 +86,15 @@ from agent_engine import (
 # At the top of main.py, ensure this import exists:
 from database import get_connection
 
+# Day 23 imports
+from billing import (
+    CheckoutRequest, CheckoutResponse, SubscriptionStatus, UsageReport,
+    init_billing_tables, create_checkout_session, handle_stripe_webhook,
+    record_usage, get_monthly_usage, create_portal_session
+)
+from stripe_config import PLANS, check_feature_access, get_plan_features
+
+
 
 
 load_dotenv()
@@ -108,6 +117,10 @@ init_tenant_tables()
 
 # Initialize agent tables on startup
 init_agent_tables()
+
+# Initialize billing tables on startup
+init_billing_tables()
+
 
 
 # ───────────────────────────────────────────────
@@ -1753,5 +1766,140 @@ async def list_workflows():
             for name, steps in WORKFLOWS.items()
         }
     }
+
+# =========================Day23=====================================================
+# ═══════════════════════════════════════════════
+# DAY 23: Micro-SaaS Launch — Stripe Billing
+# ═══════════════════════════════════════════════
+
+@app.get("/billing/plans", tags=["Billing"])
+async def list_plans():
+    """
+    List all available subscription plans with features and pricing.
+    """
+    return {
+        "plans": {
+            plan_id: {
+                "name": plan["name"],
+                "description": plan["description"],
+                "price_monthly": plan["price_monthly"],
+                "price_yearly": plan["price_yearly"],
+                "currency": plan["currency"],
+                "features": plan["features"]
+            }
+            for plan_id, plan in PLANS.items()
+        }
+    }
+
+@app.post("/billing/checkout", response_model=CheckoutResponse, tags=["Billing"])
+async def checkout(
+    request: CheckoutRequest,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Create Stripe Checkout session for subscription.
+    """
+    result = create_checkout_session(user["id"], request.plan_id, request.billing_cycle)
+    return CheckoutResponse(**result)
+
+@app.post("/billing/webhook", tags=["Billing"])
+async def stripe_webhook(request: Request):
+    """
+    Handle Stripe webhook events.
+    """
+    payload = await request.body()
+    signature = request.headers.get("stripe-signature", "")
+    
+    return handle_stripe_webhook(payload, signature)
+
+@app.get("/billing/subscription", response_model=SubscriptionStatus, tags=["Billing"])
+async def get_subscription(
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Get current subscription status.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT plan_id, status, current_period_start, current_period_end, cancel_at_period_end
+        FROM subscriptions WHERE user_id = %s
+    """, (user["id"],))
+    
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if not result:
+        # Create free subscription if none exists
+        return SubscriptionStatus(
+            plan_id="free",
+            status="active",
+            current_period_start=datetime.now(timezone.utc).isoformat(),
+            current_period_end=datetime.now(timezone.utc).isoformat(),
+            cancel_at_period_end=False
+        )
+    
+    return SubscriptionStatus(
+        plan_id=result[0],
+        status=result[1],
+        current_period_start=str(result[2]) if result[2] else None,
+        current_period_end=str(result[3]) if result[3] else None,
+        cancel_at_period_end=result[4]
+    )
+
+@app.get("/billing/usage", tags=["Billing"])
+async def usage_report(
+    month: str = None,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Get usage report for current or specified month.
+    """
+    return get_monthly_usage(user["id"], month)
+
+@app.get("/billing/portal", tags=["Billing"])
+async def customer_portal(
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Get Stripe Customer Portal URL for self-service billing management.
+    """
+    url = create_portal_session(user["id"])
+    return {"portal_url": url}
+
+@app.get("/billing/feature-check/{feature}", tags=["Billing"])
+async def check_feature(
+    feature: str,
+    user: Dict[str, Any] = Depends(get_current_user_or_api_key)
+):
+    """
+    Check if user has access to a specific feature based on their plan.
+    """
+    # Get user's plan
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT plan_id FROM subscriptions WHERE user_id = %s", (user["id"],))
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    plan_id = result[0] if result else "free"
+    
+    # Get current usage for this feature
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COALESCE(SUM(quantity), 0) FROM usage_records
+        WHERE user_id = %s AND feature = %s
+        AND TO_CHAR(recorded_at, 'YYYY-MM') = TO_CHAR(NOW(), 'YYYY-MM')
+    """, (user["id"], feature))
+    usage_result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    current_usage = int(usage_result[0]) if usage_result else 0
+    
+    return check_feature_access(plan_id, feature, current_usage)
 
 
